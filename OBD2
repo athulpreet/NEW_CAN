@@ -1,0 +1,190 @@
+#include <mcp_can.h>
+#include <SPI.h>
+#include <avr/io.h>
+#include <util/delay.h>
+#include <EEPROM.h>
+#include <avr/wdt.h>
+
+// Pins and timing definitions
+#define LED_PIN 6
+#define CAN0_INT 2
+#define PWM_PIN 9
+#define LED_BLINK_INTERVAL 500
+#define CAN_MODE_SWITCH_TIMEOUT 3000    // Reduced timeout for faster switching
+#define CAN_RESPONSE_TIMEOUT 1000       // Reduced timeout for faster response check
+#define MESSAGE_RETRY_COUNT 3           // Number of retries before switching modes
+
+// CAN configuration
+int standard = 1;
+unsigned long FUNCTIONAL_ID = 0;
+byte txData[] = {0x02,0x01,0x0D,0x55,0x55,0x55,0x55,0x55};
+
+// CAN communication variables
+unsigned long rxID;
+byte dlc;
+byte rxBuf[8];
+char msgString[128];
+volatile int speeds = 0;
+int var1 = 0;
+int var2 = 0;
+
+// Timing and control variables
+unsigned long prevTx = 0;
+unsigned int invlTx = 1000;
+unsigned long lastCanMessage = 0;
+unsigned long lastModeSwitch = 0;
+unsigned long lastLedToggle = 0;
+int messageFailCount = 0;
+
+// Status flags
+bool ledState = false;
+bool canConnected = false;
+bool vehicleConnected = false;
+
+// CAN instance
+MCP_CAN CAN0(10);
+
+void reinitializeCAN() {
+    if(CAN0.begin(standard ? MCP_STDEXT : MCP_EXT, CAN_500KBPS, MCP_8MHZ) == CAN_OK) {
+        if (standard) {
+            FUNCTIONAL_ID = 0x7DF;
+            CAN0.init_Mask(0, 0x7F00000);
+            CAN0.init_Filt(0, 0x7DF0000);
+            CAN0.init_Filt(1, 0x7E10000);
+            CAN0.init_Mask(1, 0x7F00000);
+            CAN0.init_Filt(2, 0x7DF0000);
+            CAN0.init_Filt(3, 0x7E10000);
+            CAN0.init_Filt(4, 0x7DF0000);
+            CAN0.init_Filt(5, 0x7E10000);
+        } else {
+            FUNCTIONAL_ID = 0x98DB33F1;
+            CAN0.init_Mask(0, 0x90FF0000);
+            CAN0.init_Filt(0, 0x90DA0000);
+            CAN0.init_Filt(1, 0x90DB0000);
+            CAN0.init_Mask(1, 0x90FF0000);
+            CAN0.init_Filt(2, 0x90DA0000);
+            CAN0.init_Filt(3, 0x90DB0000);
+            CAN0.init_Filt(4, 0x90DA0000);
+            CAN0.init_Filt(5, 0x90DB0000);
+        }
+        
+        CAN0.setMode(MCP_NORMAL);
+        Serial.print(standard ? "Standard" : "Extended");
+        Serial.println(" Mode Initialized");
+        canConnected = true;
+    } else {
+        Serial.println("CAN Init Failed");
+        canConnected = false;
+    }
+}
+
+void switchCANMode() {
+    standard = !standard;
+    Serial.print("Switching to ");
+    Serial.println(standard ? "Standard Mode" : "Extended Mode");
+    messageFailCount = 0;
+    reinitializeCAN();
+    lastModeSwitch = millis();
+}
+
+void updateLedStatus() {
+    if (!vehicleConnected) {
+        if (millis() - lastLedToggle >= LED_BLINK_INTERVAL) {
+            ledState = !ledState;
+            digitalWrite(LED_PIN, ledState);
+            lastLedToggle = millis();
+        }
+    } else {
+        digitalWrite(LED_PIN, HIGH);
+    }
+}
+
+void setup() {
+    // Initialize pins
+    pinMode(LED_PIN, OUTPUT);
+    pinMode(CAN0_INT, INPUT);
+    pinMode(PWM_PIN, OUTPUT);
+    
+    // Configure PWM
+    TCCR1A = _BV(COM1A1)|_BV(COM1B1);
+    TCCR1B = _BV(WGM13)|_BV(CS11)|_BV(CS10);
+    
+    // Initialize communication
+    Serial.begin(115200);
+    Serial.println("CAN System Starting");
+    
+    // Load last mode from EEPROM
+    standard = EEPROM.read(0);
+    
+    // Initialize variables
+    lastLedToggle = 0;
+    ledState = false;
+    canConnected = false;
+    vehicleConnected = false;
+    messageFailCount = 0;
+    
+    // Initial CAN setup
+    reinitializeCAN();
+}
+
+void loop() {
+    // Update PWM if speed data available
+    if (speeds > 0) {
+        var1 = 2*64*speeds;
+        var2 = 16000000/var1;
+        ICR1 = var2;
+        OCR1A = var2/2;
+    }
+    
+    // Check for incoming messages
+    if(!digitalRead(CAN0_INT)) {
+        CAN0.readMsgBuf(&rxID, &dlc, rxBuf);
+        
+        // Valid message received
+        lastCanMessage = millis();
+        vehicleConnected = true;
+        messageFailCount = 0;
+        
+        speeds = rxBuf[3];
+        Serial.print("Received Data: Speed=");
+        Serial.println(speeds);
+    }
+    
+    // Send periodic message
+    if(millis() - prevTx >= invlTx) {
+        prevTx = millis();
+        
+        if(CAN0.sendMsgBuf(FUNCTIONAL_ID, 8, txData) == CAN_OK) {
+            Serial.println("Message Sent");
+            messageFailCount = 0;
+        } else {
+            Serial.println("Send Failed");
+            messageFailCount++;
+            
+            if (messageFailCount >= MESSAGE_RETRY_COUNT) {
+                vehicleConnected = false;
+                
+                // Switch modes if we've had multiple failures
+                if (millis() - lastModeSwitch >= CAN_MODE_SWITCH_TIMEOUT) {
+                    switchCANMode();
+                }
+            }
+        }
+    }
+    
+    // Check for vehicle disconnection
+    if (vehicleConnected && (millis() - lastCanMessage > CAN_RESPONSE_TIMEOUT)) {
+        vehicleConnected = false;
+    }
+    
+    // Update LED status
+    updateLedStatus();
+    
+    // Save mode to EEPROM if we're connected
+    if (vehicleConnected) {
+        EEPROM.update(0, standard);
+    }
+    
+    // Reset watchdog
+    wdt_reset();
+}
